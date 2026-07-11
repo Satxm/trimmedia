@@ -1,0 +1,12 @@
+[Unit]
+Description=Trim Media Service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /usr/trim/entrypoint.sh
+Environment=LD_LIBRARY_PATH=/usr/trim/lib/mediasrv/lib:/usr/trim/lib LOG_LEVEL=info MEDIA_DIRS=/vol1/1000/media USER_NAME=admin
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
