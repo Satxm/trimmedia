@@ -39,6 +39,12 @@ services:
       - '<元信息文件夹>:/vol1/@appmeta/trim.media'
       - '/dev/dri/by-path:/dev/dri/by-path'
 ```
+### 镜像
+
+```
+docker pull ghcr.io/satxm/trimmedia:latest # ghcr.io
+docker pull satxm/trimmedia:latest # docker hub
+```
 
 ## ⚙️ 配置说明
 
