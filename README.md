@@ -14,15 +14,18 @@ docker run -d \
   -v <元信息文件夹>:/vol1/@appmeta/trim.media \
   --network_mode=host \
   --name trimmedia \
-  trimmedia:latest
+  ghcr.io/satxm/trimmedia:latest # ghcr.io
+  # trimmedia:latest # localbuild
+  # satxm/trimmedia:latest # docker hub
 ```
 ### 使用 Docker Compose
 
 ```docker-compose.yml
 services:
   trimmedia:
-    image: trimmedia:latest
-    # 推荐使用完整镜像地址：ghcr.io/satxm/trimmedia:latest
+    image: ghcr.io/satxm/trimmedia:latest # ghcr.io
+    # image: trimmedia:latest # localbuild
+    # image: satxm/trimmedia:latest # docker hub
     container_name: trimmedia
     restart: always
     # environment:
@@ -60,6 +63,11 @@ docker pull satxm/trimmedia:latest # docker hub
 - 默认用户名：`admin`
 - 默认密码：`123456`
 - 修改用户名：可以通过环境变量 `-e USER_NAME=<你的用户名>` 进行修改，但默认密码保持不变。
+
+### 硬件映射
+
+- `--device /dev/dri:/dev/dri` : 显卡设备映射，将宿主机上的 `/dev/dri` 整个目录挂载到容器内的相同路径
+- `-v /dev/dri/by-path:/dev/dri/by-path` : 必须映射，`by-path` 目录包含了通过系统总线路径（如 PCI 总线）链接到实际 DRI 设备的符号链接
 
 ## 🛠️ 镜像构建
 
