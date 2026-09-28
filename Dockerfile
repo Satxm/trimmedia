@@ -1,3 +1,578 @@
+FROM debian:bookworm AS builder
+
+RUN cat > fakebroker.go <<'EOF'
+package main
+
+import (
+  "bytes"
+  "encoding/binary"
+  "encoding/json"
+  "flag"
+  "fmt"
+  "io"
+  "log"
+  "net"
+  "net/http"
+  "os"
+  "path"
+  "path/filepath"
+  "strings"
+  "golang.org/x/sys/unix"
+)
+
+const (
+  appCenterAddr  = "/run/com.trim.app.center.sock"
+  brokerAddr     = "/run/trim_app_cgi/rpcbroker"
+  defaultToken   = "reserved"
+  magicNumber    = "CPRT" // magic number for rpc protocol
+  headerSize     = 80
+  payloadLenPos  = 18
+  payloadLenSize = 2
+)
+
+type (
+  Service struct {
+    Id    string `json:"id"`
+    Name  string `json:"name"`
+    IP    string `json:"ip"`
+    Uds   string `json:"uds"`
+    Type  int    `json:"type"`
+    Token string `json:"token"`
+  }
+
+  Request struct {
+    Header []byte `json:"-"`
+    Data   struct {
+      Uid      uint32   `json:"uid"`
+      Pid      uint32   `json:"pid"`
+      Req      string   `json:"req"`
+      ReqId    string   `json:"reqid"`
+      AppName  string   `json:"appName"`
+      UserName string   `json:"user"`
+      Services []string `json:"services,omitempty"`
+    } `json:"data"`
+  }
+
+  BaseResp struct {
+    Data   any    `json:"data,omitempty"`
+    ReqId  string `json:"reqid"`
+    Result string `json:"result"`
+    Rev    string `json:"rev"`
+    Req    string `json:"req,omitempty"`
+  }
+
+  Response struct {
+    Data BaseResp `json:"data"`
+  }
+
+  AppAuthorizedDir struct {
+    Type     int    `json:"storageType"`
+    Path     string `json:"path"`
+    UserName string `json:"uname"`
+  }
+
+  AuthPath struct {
+    Editable bool   `json:"isEditable"`
+    Perm     int    `json:"perm"`
+    Status   int    `json:"status"`
+    Path     string `json:"path"`
+  }
+)
+
+var (
+  username          string
+  logPath           string
+  folders           string
+  authPathResp      []byte
+  appAuthorizedDirs []AppAuthorizedDir
+  marshaledUserId   = json.RawMessage(`{"uid": 1000}`)
+  marshaledVolsInfo json.RawMessage
+
+  services = []Service{
+    {Id: "com.trim.main", Name: "TRIM Service", Uds: brokerAddr, Token: defaultToken, Type: 1},
+    {Id: "com.trim.sysinfo", Name: "System Info Provider Service", Uds: brokerAddr, Token: defaultToken},
+    {Id: "com.trim.filestor", Name: "File Storage Service", Uds: brokerAddr, Token: defaultToken},
+    {Id: "com.trim.usersrv", Name: "User Service", Uds: brokerAddr, Token: defaultToken},
+  }
+)
+
+func GetAvailableSpace(pathStr string) (uint64, error) {
+  absPath, err := filepath.Abs(pathStr)
+  if err != nil {
+    return 0, fmt.Errorf("failed to get absolute path: %w", err)
+  }
+  absPath, err = filepath.EvalSymlinks(absPath)
+  if err != nil {
+    return 0, fmt.Errorf("failed to resolve symbolic link: %w", err)
+  }
+  var stat unix.Statfs_t
+  if err := unix.Statfs(pathStr, &stat); err != nil {
+    return 0, fmt.Errorf("statfs call failed: %w", err)
+  }
+  return stat.Bavail * uint64(stat.Bsize), nil
+}
+
+func init() {
+  flag.StringVar(&username, "u", "admin", "user name")
+  flag.StringVar(&logPath, "p", "/var/log/rpcbroker.log", "log file path")
+  flag.StringVar(&folders, "f", "/vol1/1000/media:", "media folders")
+  flag.Parse()
+
+  splited := strings.Split(folders, ":")
+  appAuthorizedDirs = make([]AppAuthorizedDir, 0, len(splited))
+  authPaths := make([]AuthPath, 0, len(splited))
+
+  for _, v := range splited {
+    if strings.TrimSpace(v) == "" {
+      continue
+    }
+    appAuthorizedDirs = append(appAuthorizedDirs, AppAuthorizedDir{Path: v, Type: 3, UserName: username})
+    authPaths = append(authPaths, AuthPath{Path: v, Perm: 6, Editable: true})
+  }
+  authPathResp, _ = json.Marshal(map[string]any{"code": 0, "msg": "", "data": map[string][]AuthPath{"list": authPaths}})
+}
+
+  func getLatestVolsInfo() json.RawMessage {
+    var availableSize uint64 = 137438953472 // 默认兜底值 (128 GB)
+
+    splited := strings.Split(folders, ":")
+    for _, v := range splited {
+      if strings.TrimSpace(v) == "" {
+        continue
+      }
+      size, err := GetAvailableSpace(v)
+      if err == nil {
+        availableSize = size
+        break
+      }
+    }
+
+    return json.RawMessage(fmt.Sprintf(
+      `{"vols":[{"index":1,"state":0,"sysname":"dm-0","uuid":"trim_00000000_1111_2222_3333_444444444444-0","size":%d,"used":0,"voltype":61267}],"count":1}`,
+      availableSize,
+    ))
+  }
+
+func NewResp(req *Request, data any) BaseResp {
+  return BaseResp{ReqId: req.Data.ReqId, Req: req.Data.Req, Data: data, Result: "succ", Rev: "0.1"}
+}
+
+func NewErrorResp(req *Request) BaseResp {
+  return BaseResp{ReqId: req.Data.ReqId, Req: req.Data.Req, Result: "fail", Rev: "0.1"}
+}
+
+func readHeader(conn net.Conn) ([]byte, error) {
+  header := make([]byte, headerSize)
+  _, err := io.ReadFull(conn, header)
+  if err != nil {
+    return nil, err
+  }
+
+  if !bytes.Equal(header[:4], []byte(magicNumber)) {
+    return nil, fmt.Errorf("invalid magic number: %x", header[:4])
+  }
+
+  return header, nil
+}
+
+func parseRequest(conn net.Conn) (*Request, error) {
+  header, err := readHeader(conn)
+  if err != nil {
+    log.Printf("read header error from %s: %v\n", conn.RemoteAddr(), err)
+    return nil, err
+  }
+
+  plLen := getPayloadLength(header)
+  payload, err := readPayload(conn, plLen)
+  if err != nil {
+    log.Println("header:", string(header))
+    log.Printf("read payload error from %s: %v\n", conn.RemoteAddr(), err)
+    log.Println("payload:", string(payload))
+    return nil, err
+  }
+
+  var req Request
+  if err := json.Unmarshal(payload, &req); err != nil {
+    log.Println(string(payload))
+    return nil, fmt.Errorf("unmarshal payload failed: %w", err)
+  }
+
+  log.Println("request:", string(payload))
+  req.Header = header
+  return &req, nil
+}
+
+func getPayloadLength(header []byte) uint16 {
+  return binary.LittleEndian.Uint16(header[payloadLenPos : payloadLenPos+payloadLenSize])
+}
+
+func readPayload(conn net.Conn, length uint16) ([]byte, error) {
+  if length == 0 {
+    return nil, fmt.Errorf("payload len is zero")
+  }
+  payload := make([]byte, length)
+  _, err := io.ReadFull(conn, payload)
+  return payload, err
+}
+
+func writeResponse(conn net.Conn, header []byte, payload []byte) error {
+  length := uint16(len(payload))
+  binary.LittleEndian.PutUint16(header[payloadLenPos:payloadLenPos+payloadLenSize], length)
+  _, err := conn.Write(append(header, payload...))
+  return err
+}
+
+func processRequest(req *Request) BaseResp {
+  switch req.Data.Req {
+  case "com.trim.rpcbroker.apply":
+    return NewResp(req, services)
+
+  case "com.trim.usersrv.getUserId", "com.trim.sysinfo.getUserId":
+    return NewResp(req, marshaledUserId)
+
+  case "com.trim.filestor.getAppAuthorizedDir":
+    return NewResp(req, appAuthorizedDirs)
+
+  case "com.trim.sysinfo.getAllVolsInfo":
+    return NewResp(req, getLatestVolsInfo()) 
+
+  default:
+    log.Println("unknown req:", req.Data.Req)
+    return NewErrorResp(req)
+  }
+}
+
+func handleConnection(conn net.Conn) {
+  defer conn.Close()
+  addr := conn.RemoteAddr()
+
+  log.Printf("client %s connected\n", addr)
+
+  for {
+    req, err := parseRequest(conn)
+    if err != nil {
+      log.Printf("read request error from %s: %v\n", addr, err)
+      return
+    }
+
+    resp := processRequest(req)
+
+    data, _ := json.Marshal(Response{Data: resp})
+    log.Println("response:", string(data))
+    if err := writeResponse(conn, req.Header, data); err != nil {
+      log.Printf("write resp error: %v\n", err)
+      return
+    }
+  }
+}
+
+func main() {
+  log.SetFlags(log.LstdFlags | log.Lshortfile)
+  logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+  if err != nil {
+    log.Fatalf("cannot open log file: %s: %v", logPath, err)
+  }
+  defer logFile.Close()
+  log.SetOutput(logFile)
+
+  // start auth http server
+  os.RemoveAll(appCenterAddr)
+  al, err := net.Listen("unix", appCenterAddr)
+  if err != nil {
+    log.Fatalf("cannot listen http unix: %v", err)
+  }
+  defer al.Close()
+
+  http.HandleFunc("/rpc/v1/sysconfig/app/auth-path", func(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    w.Write(authPathResp)
+  })
+
+  go func() {
+    log.Println("app center serve:", http.Serve(al, nil))
+  }()
+
+  // start rpc broker
+  os.Remove(brokerAddr)
+  os.MkdirAll(path.Dir(brokerAddr), 0755)
+
+  listener, err := net.Listen("unix", brokerAddr)
+  if err != nil {
+    log.Fatalf("listen rpc broker %s failed: %v", brokerAddr, err)
+  }
+  defer listener.Close()
+
+  log.Printf("rpc broker listening on %s\n", brokerAddr)
+
+  for {
+    conn, err := listener.Accept()
+    if err != nil {
+      log.Printf("accept error: %v\n", err)
+      continue
+    }
+    go handleConnection(conn)
+  }
+}
+
+EOF
+
+RUN cat > media.sql <<"EOF"
+PRAGMA foreign_keys=OFF;
+BEGIN TRANSACTION;
+CREATE TABLE `item` (`guid` text,`trim_id` text,`imdb_id` text,`tmdb_id` integer,`pinyin` text,`type` text,`lan` text,`title` text,`sort_title` text,`sort_num` integer DEFAULT 2147483647,`original_title` text,`overview` text,`adult` integer NOT NULL DEFAULT 0,`runtime` integer,`release_date` text,`parent_guid` text,`alternative_titles` text,`backdrops` text,`backdrop_height` integer DEFAULT 0,`backdrop_width` integer DEFAULT 0,`backdrop_height_width_try` integer DEFAULT 0,`logos` text,`posters` text,`poster_height` integer DEFAULT 0,`poster_width` integer DEFAULT 0,`poster_height_width_try` integer DEFAULT 0,`production_countries` text,`external_ids` text,`origin_country` text,`content_ratings` text,`first_air_date` text,`last_air_date` text,`air_date` text,`vote_average` real,`vote_count` integer,`number_of_seasons` integer,`number_of_episodes` integer,`status` text DEFAULT "1",`season_number` integer,`episode_number` integer,`still_path` text,`keywords` text,`path` text,`fetch_status` integer,`logic_type` integer DEFAULT 0,`dir` text,`filename` text,`episode_imdb_id` text,`create_time` integer,`update_time` integer, `poster_type` integer DEFAULT 0, `nfo_path` text DEFAULT "",PRIMARY KEY (`guid`));
+CREATE TABLE `item_ancestor` (`item_guid` text NOT NULL,`ancestor_guid` text NOT NULL,`create_time` integer,`update_time` integer);
+CREATE TABLE `item_media` (`guid` text,`item_guid` text NOT NULL,`dir` text DEFAULT "",`path` text NOT NULL,`size` integer,`can_play` integer DEFAULT 1,`type` integer NOT NULL,`mod_time` integer,`file_hash` text,`create_time` integer,`update_time` integer,`file_birth_time` integer,`recognition_status` integer DEFAULT 1,`progress_thumb_hash_dir` text,`progress_thumb_errno` integer,`cloud_storage_type` integer,`mount_path` text,`fid` text,`pick_code` text,`content_hash` text, `sort_num` integer DEFAULT 0,PRIMARY KEY (`guid`));
+CREATE TABLE `item_person` (`item_guid` text NOT NULL,`person_guid` text NOT NULL,`role` text,`job` text,`order` integer,`department` text);
+CREATE TABLE `item_tag` (`item_guid` text NOT NULL,`tag` text NOT NULL,`type` text);
+CREATE TABLE `item_user` (`user_guid` text NOT NULL,`item_guid` text NOT NULL,`is_admin` integer NOT NULL,`create_time` integer,`update_time` integer);
+CREATE TABLE `item_user_favorite` (`user_guid` text NOT NULL,`item_guid` text NOT NULL,`item_type` text,`create_time` integer,`update_time` integer);
+CREATE TABLE `item_user_play` (`item_guid` text NOT NULL,`user_guid` text NOT NULL,`ts` integer DEFAULT 0,`watched` integer DEFAULT 0,`media_guid` text,`video_guid` text,`audio_guid` text,`subtitle_guid` text,`direct_link_audio_index` integer DEFAULT -1,`resolution` text,`bitrate` integer,`type` text,`visible` integer DEFAULT 1,`create_time` integer,`update_time` integer);
+CREATE TABLE `media_delete` (`ancestor_guid` text NOT NULL,`media_path` text NOT NULL,`dir` text DEFAULT "",`is_dir` numeric DEFAULT false,`create_time` integer,`update_time` integer);
+CREATE TABLE `media_property` (`media_guid` text NOT NULL,`category` text,`content` text,`update_time` integer,`create_time` integer);
+CREATE TABLE `media_server` (`guid` text NOT NULL,`name` text,`lan` text,`meta_dir` text,`file_monitor` integer,`region` text,`direct_link_enable` integer DEFAULT 1,`direct_link_allowed_level` integer DEFAULT 0,`direct_link_allowed_drives` text,`create_time` integer,`update_time` integer,PRIMARY KEY (`guid`));
+INSERT INTO media_server VALUES('24acb7d71a05482e8f4b6b4097d39373','MediaHub','zh-CN','/vol1/@appmeta/trim.media',1,'CN',1,0,'',1764039737866,1764039737866);
+CREATE TABLE `media_stream` (`guid` text NOT NULL,`title` text,`media_guid` text NOT NULL,`codec_name` text,`codec_type` text,`color_range` text,`profile` text,`index` integer,`width` integer,`height` integer,`coded_width` integer,`coded_height` integer,`display_aspect_ratio` text,`pix_fmt` text,`level` text,`color_space` text,`color_transfer` text,`color_primaries` text,`dv_profile` integer NOT NULL DEFAULT 0,`refs` integer,`rotation` real,`r_frame_rate` text,`avg_frame_rate` text,`time_base` text,`start_pts` integer,`start_time` text,`duration_pts` integer,`duration` integer,`is_default` integer,`forced` integer,`bps` integer,`language` text,`channels` integer,`sample_rate` text,`bits_per_raw_sample` text,`is_external` integer,`channel_layout` text,`create_time` integer,`update_time` integer,`resolution_type` text,`audio_type` text,`color_range_type` text,`bit_depth` integer,`progressive` integer,`origin_filename` text,`filepath` text,`source_id` text,`source` text,`trim_id` text,`release` text,`uploader` text,`status` integer NOT NULL DEFAULT 1,`ext1` integer DEFAULT 0,`container_format` text,`is_bluray` numeric DEFAULT false,`key_frame_interval` integer,PRIMARY KEY (`guid`));
+CREATE TABLE `mediadb_config` (`item_guid` text NOT NULL,`subtitle_lan` text,`auto_scrap_subtitle` integer,`category` text,`create_time` integer,`update_time` integer,`include_adult` numeric DEFAULT false,`view_type` integer DEFAULT 0,`auto_progress_thumb` integer DEFAULT 0,`skip_filesize` integer DEFAULT 0, `dir_list` text, `poster_type` integer DEFAULT 0, `prefer_local_nfo` integer DEFAULT 0, `iptv_source_type` text, `iptv_source_url` text, `iptv_refresh_interval` integer DEFAULT 3600, `iptv_refresh_enabled` numeric DEFAULT false, `iptv_last_refresh_status` text, `iptv_last_refresh_time` integer DEFAULT 0, `iptv_last_success_time` integer DEFAULT 0, `iptv_last_error` text, `iptv_channel_count` integer DEFAULT 0, `iptv_line_count` integer DEFAULT 0, `iptv_invalid_count` integer DEFAULT 0);
+CREATE TABLE `permission` (`permission` text NOT NULL,`create_time` integer,`update_time` integer);
+INSERT INTO permission VALUES('mdb_manager',1764039562954,1764039562954);
+INSERT INTO permission VALUES('user_manager',1764039562954,1764039562954);
+INSERT INTO permission VALUES('metadata_manager',1764039562954,1764039562954);
+INSERT INTO permission VALUES('server_manager',1764039562954,1764039562954);
+INSERT INTO permission VALUES('task_manager',1764039562954,1764039562954);
+CREATE TABLE `person` (`guid` text NOT NULL,`trim_id` text,`imdb_id` text,`tmdb_id` integer,`lan` text NOT NULL,`pinyin` text,`name` text,`original_name` text,`also_know_as` text,`biography` text,`know_for_department` text,`images` text,`profile_path` text,`gender` integer,`create_time` integer,`update_time` integer,PRIMARY KEY (`guid`));
+CREATE TABLE `schedule` (`guid` text NOT NULL,`name` text,`type` text,`interval` integer,`status` integer NOT NULL DEFAULT 1,`create_time` integer,`update_time` integer,PRIMARY KEY (`guid`));
+INSERT INTO schedule VALUES('schedule-item-scrap','scrap-item','TaskItemScrap',86400,1,1764039562954,1764039562954);
+INSERT INTO schedule VALUES('schedule-subtitle-extra','extra-subtitle','TaskSubtitleExtra',86400,1,1764039562954,1764039562954);
+CREATE TABLE `sys_metadata` (`key` text NOT NULL,`value` text,`private` integer,`create_time` integer,`update_time` integer,PRIMARY KEY (`key`));
+INSERT INTO sys_metadata VALUES('db_version','v17',0,1764039563,1783836195);
+INSERT INTO sys_metadata VALUES('global_task_switch','1',0,1764039563,1764039563);
+INSERT INTO sys_metadata VALUES('defaultmetadir','/vol1/@appmeta/trim.media',0,1764039564,1764039564);
+INSERT INTO sys_metadata VALUES('sys_secret','568ba6e4e64f38ed08e249538849dea95b7d542c36361eba05bacc1ce696f632c',1,1764039737,1764039737);
+INSERT INTO sys_metadata VALUES('mediasrv_cache_dir','/vol1',0,1764039737,1764039737);
+CREATE TABLE `tag` (`guid` text NOT NULL,`tag` text NOT NULL,`type` text,`trim_id` text,PRIMARY KEY (`guid`));
+CREATE TABLE `user` (`guid` text,`username` text,`passwd` text,`lan` text,`last_login_time` integer,`is_admin` integer,`media_permission` integer,`status` integer,`create_time` integer,`update_time` integer, `audio_lan` text,PRIMARY KEY (`guid`));
+INSERT INTO user VALUES('default-user-template','user-template',NULL,NULL,NULL,0,1,0,1764039562954,1764039562954,NULL);
+INSERT INTO user VALUES('62ea6f528af04dd3977bd364c4148c01','___USER_NAME___','dJp5/s0mfAaCA1d1p3YTxQBVDJJmQzJb3K/dNghHRLM=','zh-CN',1783836207,1,2,1,1764039737913,1764039737913,NULL);
+CREATE TABLE `user_permission` (`user_guid` text NOT NULL,`permission` text NOT NULL,`status` integer NOT NULL DEFAULT 1,`create_time` integer,`update_time` integer);
+CREATE TABLE `user_source` (`user_guid` text NOT NULL,`source_id` text NOT NULL,`source` text NOT NULL,`source_name` text,`create_time` integer,`update_time` integer);
+INSERT INTO user_source VALUES('62ea6f528af04dd3977bd364c4148c01','1000','Trim-NAS','___USER_NAME___',1764039637294,1764039637294);
+CREATE TABLE `download_task` (`guid` text NOT NULL,`media_guid` text NOT NULL,`user_guid` text NOT NULL,`resolution` text NOT NULL,`media_file` text NOT NULL,`output_file` text NOT NULL,`status` integer NOT NULL DEFAULT 0,`direct_download` integer NOT NULL DEFAULT 0,`create_time` integer,`update_time` integer,PRIMARY KEY (`guid`));
+CREATE TABLE `item_play_config` (`item_guid` text,`user_guid` text,`skip_opening` integer,`skip_ending` integer,PRIMARY KEY (`item_guid`,`user_guid`));
+CREATE TABLE `resource_download` (`guid` text,`source_url` text NOT NULL,`hash_path` text NOT NULL,`resource_type` text NOT NULL DEFAULT "image",`owner_type` text NOT NULL,`owner_guid` text NOT NULL,`owner_field` text NOT NULL,`status` text NOT NULL DEFAULT "pending",`retry_count` integer NOT NULL DEFAULT 0,`next_retry_time` integer NOT NULL DEFAULT 0,`last_error` text,`create_time` integer,`update_time` integer,`finish_time` integer NOT NULL DEFAULT 0,PRIMARY KEY (`guid`));
+CREATE TABLE `field_lock` (`entity_type` text NOT NULL,`entity_id` text NOT NULL,`field_name` text NOT NULL,`is_locked` numeric DEFAULT false,`create_time` integer,`update_time` integer,PRIMARY KEY (`entity_type`,`entity_id`,`field_name`));
+CREATE TABLE `custom_tag` (`id` integer PRIMARY KEY AUTOINCREMENT,`type` text NOT NULL,`value` text NOT NULL,`create_time` integer NOT NULL);
+DELETE FROM sqlite_sequence;
+INSERT INTO sqlite_sequence VALUES('custom_tag',90000);
+CREATE INDEX `idx_dir` ON `item`(`dir`);
+CREATE INDEX `idx_path` ON `item`(`path`);
+CREATE INDEX `idx_parent_guid` ON `item`(`parent_guid`);
+CREATE INDEX `idx_tmdb_id` ON `item`(`tmdb_id`);
+CREATE INDEX `idx_imdb_id` ON `item`(`imdb_id`);
+CREATE INDEX `idx_trim_id` ON `item`(`trim_id`);
+CREATE INDEX `idx_ancestor_guid` ON `item_ancestor`(`ancestor_guid`);
+CREATE INDEX `idx_itemancestor_item_guid` ON `item_ancestor`(`item_guid`);
+CREATE INDEX `idx_file_hash` ON `item_media`(`file_hash`);
+CREATE INDEX `idx_itemmedia_path` ON `item_media`(`path`);
+CREATE INDEX `idx_itemmedia_dir` ON `item_media`(`dir`);
+CREATE INDEX `idx_itemmedia_item_guid` ON `item_media`(`item_guid`);
+CREATE INDEX `idx_person_guid` ON `item_person`(`person_guid`);
+CREATE INDEX `idx_itemperson_item_guid` ON `item_person`(`item_guid`);
+CREATE INDEX `idx_itemtag_tag` ON `item_tag`(`tag`);
+CREATE INDEX `idx_item_tag_guid` ON `item_tag`(`item_guid`);
+CREATE UNIQUE INDEX `uk_user_item` ON `item_user`(`user_guid`,`item_guid`);
+CREATE INDEX `idx_itemuserfavorite_item_guid` ON `item_user_favorite`(`item_guid`);
+CREATE INDEX `idx_itemuserfavorite_user_guid` ON `item_user_favorite`(`user_guid`);
+CREATE INDEX `idx_itemuserplay_user_guid` ON `item_user_play`(`user_guid`);
+CREATE UNIQUE INDEX `uk_item_user` ON `item_user_play`(`item_guid`,`user_guid`);
+CREATE INDEX `idx_itemuserplay_item_guid` ON `item_user_play`(`item_guid`);
+CREATE INDEX `idx_mediadelete_dir` ON `media_delete`(`dir`);
+CREATE UNIQUE INDEX `uk_ancestor_path` ON `media_delete`(`ancestor_guid`,`media_path`);
+CREATE INDEX `idx_mediaproperty_media_guid` ON `media_property`(`media_guid`);
+CREATE INDEX `idx_filepath` ON `media_stream`(`filepath`);
+CREATE INDEX `idx_mediastream_media_guid` ON `media_stream`(`media_guid`);
+CREATE INDEX `idx_mediadbconfig_item_guid` ON `mediadb_config`(`item_guid`);
+CREATE INDEX `idx_permission` ON `permission`(`permission`);
+CREATE INDEX `idx_person_tmdb_id` ON `person`(`tmdb_id`);
+CREATE INDEX `idx_person_imdb_id` ON `person`(`imdb_id`);
+CREATE INDEX `idx_person_trim_id` ON `person`(`trim_id`);
+CREATE INDEX `idx_tag_tag` ON `tag`(`tag`);
+CREATE UNIQUE INDEX `uk_username` ON `user`(`username`);
+CREATE UNIQUE INDEX `uk_user_guid_permission` ON `user_permission`(`user_guid`,`permission`);
+CREATE UNIQUE INDEX `uk_user_guid_source` ON `user_source`(`user_guid`,`source_id`,`source`);
+CREATE INDEX `idx_user_guid` ON `download_task`(`user_guid`);
+CREATE INDEX `idx_task_guid` ON `download_task`(`media_guid`);
+CREATE UNIQUE INDEX idx_item_guid_path ON item_media(item_guid, path);
+CREATE INDEX `idx_resource_download_next_retry` ON `resource_download`(`next_retry_time`);
+CREATE INDEX `idx_resource_download_status` ON `resource_download`(`status`);
+CREATE INDEX `idx_resource_download_owner` ON `resource_download`(`owner_guid`);
+CREATE INDEX `idx_resource_download_hash_path` ON `resource_download`(`hash_path`);
+CREATE UNIQUE INDEX `uk_resource_download_target` ON `resource_download`(`source_url`,`owner_type`,`owner_guid`,`owner_field`);
+CREATE INDEX `idx_nfo_path` ON `item`(`nfo_path`);
+CREATE INDEX `idx_type` ON `custom_tag`(`type`);
+CREATE UNIQUE INDEX uk_item_tag ON item_tag(item_guid, tag, type);
+COMMIT;
+EOF
+
+RUN cat > start.sh <<'EOF' && chmod +x start.sh
+#!/bin/bash
+
+set -euxm
+
+shutdown() {
+  echo "Shutting down..." >&2
+  kill -9 0 2>/dev/null || true
+  exit 0
+}
+
+trap shutdown SIGINT SIGTERM
+
+# start mediasrv
+/usr/trim/bin/mediasrv -o /usr/trim/logs/mediasrv.log -a /var/run/mediasrv.socket &
+pid1=$!
+
+# start rpcbroker
+/usr/trim/bin/rpcbroker -u ${USER_NAME} -f ${MEDIA_DIRS} &
+pid2=$!
+
+# init database
+if [ ! -f /vol1/@appdata/trim.media/database/trimmedia.db ]; then
+  # make sure folder exists
+  mkdir -p /vol1/@appdata/trim.media/database
+  sed "s/___USER_NAME___/${USER_NAME}/g" /var/apps/trim.media/media.sql | sqlite3 /vol1/@appdata/trim.media/database/trimmedia.db
+fi
+
+# change owner
+chown -R ${PUID}:${GUID} ${MEDIA_DIRS}
+
+# start trim-media
+/var/apps/trim.media/target/trim-media --port=8005 \
+  --root=/vol1/@appdata/trim.media \
+  --meta=/vol1/@appmeta/trim.media \
+  --static=/var/apps/trim.media/target \
+  --trim-appname=trim.media \
+  --trim-username=trim-media \
+  --log-dir=/var/apps/trim.media/logs \
+  --log-level=${LOG_LEVEL} &
+pid3=$!
+
+tail -vF /var/apps/trim.media/logs/trim-media.log &
+wait -n $pid1 $pid2 $pid3
+
+exit_code=$?
+
+echo "One of the apps exited with code $" >&2
+
+kill -9 0
+
+exit $exit_code
+
+EOF
+
+RUN apt update && apt install -y curl jq gawk openssl binutils xz-utils
+
+RUN cat > mediasrv.sh <<'EOF' && chmod +x mediasrv.sh && /bin/bash mediasrv.sh
+#!/bin/bash
+set -ux
+
+command -v curl >/dev/null 2>&1 || apt install -y curl
+command -v jq >/dev/null 2>&1 || apt install -y jq
+command -v ar >/dev/null 2>&1 || apt install -y binutils
+command -v gawk >/dev/null 2>&1 || apt install -y gawk
+command -v xz >/dev/null 2>&1 || apt install -y xz-utils
+
+data=$(curl -sS "https://apiv2-liveupdate.fnnas.com/" | jq -r '.packages[] | select(.packageName=="trim")' 2>/dev/null)
+dlkey=$(echo "$data" | jq -r '.dlkey')
+url=$(echo "$data" | jq -r '.url')
+version=$(echo "$data" | jq -r '.version')
+description=$(echo "$data" | jq -r '.description')
+filename=$(basename $url)
+t=$(date +%s)
+
+bytes=$(printf '%s' "$dlkey" | base64 -d 2>/dev/null | od -An -tx1 | tr -s ' ' '\n' | sed '/^$/d')
+secret=$(printf '%s\n' "$bytes" | gawk '{for(i=1;i<=NF;i++) printf "%c", xor(strtonum("0x"$i), 94)}')
+path=$(sed -E 's#^[^/]*//[^/]*([^?]*)?.*$#\1#' <<< "$url")
+
+sign=$(printf '%s' "${secret}${path}${t}" | md5sum | awk '{print $1}')
+url="${url}?sign=${sign}&t=${t}"
+
+curl -fL -C - -R -O "$url"
+
+ar x "$filename"
+mkdir -p mediasrv mediasrv/etc
+
+tar -C mediasrv -xvf data.tar.xz \
+ ./usr/trim/bin/mediasrv \
+ ./usr/trim/lib/mediasrv \
+ ./usr/trim/lib/libhwinfo.so \
+ ./usr/trim/lib/libhwinfo.so.0 \
+ ./usr/trim/lib/libhwinfo.so.0.8 \
+ ./usr/trim/lib/libigputop.so \
+ ./usr/trim/lib/libigputop.so.0 \
+ ./usr/trim/lib/libigputop.so.0.7 \
+ ./usr/trim/lib/libnebula.so \
+ ./usr/trim/lib/libppjson.so \
+ --strip-components=3
+
+EOF
+
+RUN cat > trim-media.sh <<'EOF' && chmod +x trim-media.sh && /bin/bash trim-media.sh
+#!/bin/bash
+set -ux
+
+command -v curl >/dev/null 2>&1 || apt install -y curl
+command -v jq >/dev/null 2>&1 || apt install -y jq
+command -v openssl >/dev/null 2>&1 || apt install -y openssl
+
+appname="trim.media"
+
+headers=(
+  -H "Trim-Kernel: 6.18.18.c1032-trim-1032"
+  -H "Trim-Language: zh-CN"
+  -H "Trim-Machine-Id: 601e3a4be3354fc3aa7ecadbae2e0b1cd329fd02"
+  -H "Trim-Os-Version: 1.2.0604"
+  -H "Trim-Platform: x86"
+  -H "Content-Type: application/json"
+)
+
+detailbody="{\"appName\":\"$appname\"}"
+detail=$(curl -sS "${headers[@]}" -X GET -d "$detailbody" "https://aps.fnnas.com/api/v1/app/detail")
+
+version=$(echo "$detail" | jq -r '.data.lastVersion')
+appid=$(echo "$detail" | jq -r '.data.appId')
+
+applynody='{"appId":'"$appid"',"version":"'"$version"'","auth":"'"031c4865-b193-44c0-bfa6-a20d2994ea20"'"}'
+apply=$(curl -sS "${headers[@]}" -X POST -d "$applynody" "https://aps.fnnas.com/api/v1/app/apply")
+
+url=$(echo "$apply" | jq -r '.data.downloadLink')
+md5=$(echo "$apply" | jq -r '.data.checkSum')
+encrypt=$(echo "$apply" | jq -r '.data.encryptBlock')
+filename=$(echo "$apply" | jq -r '.data.package')
+filesize=$(echo "$apply" | jq -r '.data.fileSize')
+
+curl -fL -C - -R -O "$url"
+
+sep=$'`'
+input="${appname}${sep}${version}${sep}${encrypt}${sep}trimAppCenter"
+key=$(printf '%s' "$input" | openssl dgst -sha256 -r | cut -d' ' -f1)
+iv="${key:0:32}"
+
+openssl enc -aes-256-cfb -d -K "$key" -iv "$iv" -in "$filename" -out "${appname}_${version}_decrypt.tar" -nosalt
+
+mkdir -p trim.media trim.media/target
+tar -C trim.media -xvf "${appname}_${version}_decrypt.tar" --exclude="app.tgz"
+tar -xvf "${appname}_${version}_decrypt.tar" app.tgz
+tar -C trim.media/target -xvf "app.tgz"
+mv start.sh media.sql trim.media/
+
+EOF
+
+RUN GOPKG=go1.26.8.linux-amd64 && curl -O https://dl.google.com/go/${GOPKG}.tar.gz && \
+ tar -C /opt -xvf ${GOPKG}.tar.gz && /opt/go/bin/go mod init fakebroker && /opt/go/bin/go get golang.org/x/sys/unix && \
+ /opt/go/bin/go build -o mediasrv/bin/rpcbroker fakebroker.go
+
+# ====== end of builder ======
+
+# ======  final stage   ======
 FROM debian:bookworm
 
 ENV LD_LIBRARY_PATH=/usr/trim/lib/mediasrv \
@@ -7,8 +582,7 @@ ENV LD_LIBRARY_PATH=/usr/trim/lib/mediasrv \
     PUID=1000 \
     GUID=1000
 
-RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \
-    apt update && \
+RUN apt update && \
     apt install -y \
         sqlite3 openssl ca-certificates \
         libass9 libbluray2 libmp3lame0 libopenmpt0 libopus0 \
@@ -19,8 +593,8 @@ RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debi
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
-ADD ./mediasrv.tgz /usr/trim/
-ADD ./trim.media.tgz /var/apps/trim.media/
+COPY --from=builder /mediasrv /usr/trim
+COPY --from=builder /trim.media /var/apps/trim.media
 
 VOLUME ["/vol1/1000/media", "/vol1/@appdata/trim.media", "/vol1/@appmeta/trim.media"]
 

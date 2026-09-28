@@ -3,9 +3,9 @@
 set -euxm
 
 shutdown() {
-    echo "Shutting down..." >&2
-    kill -9 0 2>/dev/null || true
-    exit 0
+  echo "Shutting down..." >&2
+  kill -9 0 2>/dev/null || true
+  exit 0
 }
 
 trap shutdown SIGINT SIGTERM

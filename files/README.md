@@ -1,5 +1,14 @@
 # 📦 trimmedia
 
+## 📝 更新说明
+
+2026.9.25❗**更新镜像时请替换容器路径**❗
+
+修改容器内数据文件夹路径 `/vol1/mediadata` 为 `/vol1/@appdata/trim.media`；
+支持指定 `PUID` `GUID` 以设定媒体文件夹所有者权限。
+
+❗**更新镜像时请替换容器路径**❗
+
 ## 🚀 快速部署
 
 ### 使用 Docker 命令
@@ -76,9 +85,46 @@ docker pull satxm/trimmedia:latest # docker hub
 
 ## 🛠️ 镜像构建
 
+如果你需要自行构建镜像，请按照以下步骤操作：
+
+### 准备文件：
+
+从已安装影视应用的飞牛系统中拷贝并打包以下文件：
+
+- 创建临时文件夹 `mediasrv` ，并拷贝以下文件：
+
+```bash
+mkdir -p mediasrv/bin mediasrv/lib mediasrv/etc;
+cp -rp /usr/trim/bin/mediasrv mediasrv/bin/;
+cp -rp /usr/trim/lib/{mediasrv,libhwinfo.so,libhwinfo.so.0,libhwinfo.so.0.8,libigputop.so,libigputop.so.0,libigputop.so.0.7,libnebula.so,libppjson.so} mediasrv/lib/
+mkdir trim.media
+cp -rp /var/apps/trim.media/{cmd,config,i18n,wizard,ICON.PNG,ICON_256.PNG,manifest} trim.media/
+cp -rp /usr/local/apps/@appcenter/trim.media trim.media/target
+```
+
+- 将 `entrypoint.sh` 和 `media.sql` 添加到 `trim.media` 文件夹，并赋予其可执行权限；
+
+- 编译 `fakebroker.go` 到 `mediasrv/bin/rpcbroker`，并赋予其可执行权限；
+
+```bash
+curl -O https://dl.google.com/go/go1.26.8.linux-amd64.tar.gz && tar -xvf go1.26.8.linux-amd64.tar.gz && export PATH=$PWD/go/bin:$PATH
+go env -w GOPROXY=https://goproxy.cn,direct
+go env -w GOSUMDB=sum.golang.org
+go mod init fakebroker
+go get golang.org/x/sys/unix
+go build -o mediasrv/bin/rpcbroker fakebroker.go
+```
+
+- 重新打包 `mediasrv.tgz` 和 `trim.media.tgz`。
+
+```bash
+tar -C mediasrv -czvf mediasrv.tgz .
+tar -C trim.media -czvf trim.media.tgz .
+```
+
 ### 执行构建：
 
-此 Dockerfile 为一键构建，无需额外准备文件。
+将上述 tgz 压缩包及 `Dockerfile` 放在同一目录下，执行：
 
 ```bash
 docker build --no-cache -t trimmedia .

@@ -4,7 +4,7 @@ Description=Trim Media Service
 [Service]
 Type=simple
 ExecStart=/bin/bash /usr/trim/entrypoint.sh
-Environment=LD_LIBRARY_PATH=/usr/trim/lib/mediasrv/lib:/usr/trim/lib LOG_LEVEL=info MEDIA_DIRS=/vol1/1000/media USER_NAME=admin
+Environment=LD_LIBRARY_PATH=/usr/trim/lib/mediasrv/lib:/usr/trim/lib LOG_LEVEL=info MEDIA_DIRS=/vol1/1000/media USER_NAME=admin PUID=1000 GUID=1000
 Restart=always
 RestartSec=5
 
