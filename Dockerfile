@@ -480,7 +480,7 @@ command -v ar >/dev/null 2>&1 || apt install -y binutils
 command -v gawk >/dev/null 2>&1 || apt install -y gawk
 command -v xz >/dev/null 2>&1 || apt install -y xz-utils
 
-data=$(curl -sS "https://apiv2-liveupdate.fnnas.com/" | jq -r '.packages[] | select(.packageName=="trim")' 2>/dev/null)
+data=$(curl -sS "https://apiv2-liveupdate.fnnas.com/" | head -c -256 | jq -r '.packages[] | select(.packageName=="trim")')
 dlkey=$(echo "$data" | jq -r '.dlkey')
 url=$(echo "$data" | jq -r '.url')
 version=$(echo "$data" | jq -r '.version')
@@ -557,18 +557,20 @@ key=$(printf '%s' "$input" | openssl dgst -sha256 -r | cut -d' ' -f1)
 iv="${key:0:32}"
 
 openssl enc -aes-256-cfb -d -K "$key" -iv "$iv" -in "$filename" -out "${appname}_${version}_decrypt.tar" -nosalt
+dd if=/dev/zero of="${appname}_${version}_decrypt.tar" bs=512 count=4 oflag=append conv=notrunc
 
-mkdir -p trim.media trim.media/target
-tar -C trim.media -xvf "${appname}_${version}_decrypt.tar" --exclude="app.tgz"
+mkdir -p "${appname}" "${appname}/target"
+tar -C "${appname}" -xvf "${appname}_${version}_decrypt.tar" --exclude="app.tgz"
 tar -xvf "${appname}_${version}_decrypt.tar" app.tgz
-tar -C trim.media/target -xvf "app.tgz"
-mv start.sh media.sql trim.media/
+tar -C "${appname}/target" -xvf "app.tgz"
+mv start.sh media.sql "${appname}/"
 
 EOF
 
-RUN GOPKG=go1.26.8.linux-amd64 && curl -O https://dl.google.com/go/${GOPKG}.tar.gz && \
- tar -C /opt -xvf ${GOPKG}.tar.gz && /opt/go/bin/go mod init fakebroker && /opt/go/bin/go get golang.org/x/sys/unix && \
- /opt/go/bin/go build -o mediasrv/bin/rpcbroker fakebroker.go
+RUN curl -O https://dl.google.com/go/go1.26.8.linux-amd64.tar.gz && \
+ tar -C /opt -xvf go1.26.8.linux-amd64.tar.gz && /opt/go/bin/go mod init fakebroker && \
+ /opt/go/bin/go get golang.org/x/sys@v0.48.0 && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 && \
+ /opt/go/bin/go build -trimpath -ldflags="-s -w -buildid=" -o mediasrv/bin/rpcbroker fakebroker.go
 
 # ====== end of builder ======
 
