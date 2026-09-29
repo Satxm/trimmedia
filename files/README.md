@@ -87,6 +87,10 @@ docker pull satxm/trimmedia:latest # docker hub
 
 如果你需要自行构建镜像，请按照以下步骤操作：
 
+### 自动下载：
+
+以管理员身份运行 `files` 文件夹下的 `mediasrv.sh` 和 `trim-media.sh` 脚本，生成 `mediasrv.tgz` 和 `trim.media.tgz` 文件。
+
 ### 准备文件：
 
 从已安装影视应用的飞牛系统中拷贝并打包以下文件：
@@ -127,7 +131,7 @@ tar -C trim.media -czvf trim.media.tgz .
 将上述 tgz 压缩包及 `Dockerfile` 放在同一目录下，执行：
 
 ```bash
-docker build --no-cache -t trimmedia .
+docker build--platform linux/amd64 --no-cache -t trimmedia .
 ```
 
 ## 参考来源
