@@ -81,7 +81,8 @@ docker pull satxm/trimmedia:latest # docker hub
 此 Dockerfile 为一键构建，无需额外准备文件。
 
 ```bash
-docker build --platform linux/amd64 --no-cache -t trimmedia .
+docker build --platform linux/amd64 --no-cache -t trimmedia:amd64 -f Dockerfile-amd64 .
+docker build --platform linux/arm64 --no-cache -t trimmedia:arm64 -f Dockerfile-arm64 .
 ```
 
 ## 参考来源

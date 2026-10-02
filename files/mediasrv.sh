@@ -1,4 +1,22 @@
 #!/bin/bash
+
+arch="${1:-amd64}"
+
+case "$arch" in
+  amd64)
+    platform="x86"
+    ;;
+  arm64)
+    platform="arm"
+    ;;
+  *)
+    echo "Usage: $0 {amd64|arm64}"
+    exit 1
+    ;;
+esac
+
+echo "Building for platform: $arch"
+
 set -eux
 
 cat > fakebroker.go <<'EOF'
@@ -317,13 +335,18 @@ func main() {
 
 EOF
 
-command -v curl >/dev/null 2>&1 || sudo apt install -y curl
-command -v jq >/dev/null 2>&1 || sudo apt install -y jq
-command -v ar >/dev/null 2>&1 || sudo apt install -y binutils
-command -v gawk >/dev/null 2>&1 || sudo apt install -y gawk
-command -v xz >/dev/null 2>&1 || sudo apt install -y xz-utils
+apt update
 
-data=$(curl -sS "https://apiv2-liveupdate.fnnas.com/" | head -c -256 | jq -r '.packages[] | select(.packageName=="trim")')
+command -v curl >/dev/null 2>&1 || apt install -y curl
+command -v jq >/dev/null 2>&1 || apt install -y jq
+command -v ar >/dev/null 2>&1 || apt install -y binutils
+command -v gawk >/dev/null 2>&1 || apt install -y gawk
+command -v xz >/dev/null 2>&1 || apt install -y xz-utils
+if [ "$arch" = "arm64" ]; then
+command -v aarch64-linux-gnu-objdump >/dev/null 2>&1 || apt install -y binutils-aarch64-linux-gnu
+fi
+
+data=$(curl -sS "https://apiv2-liveupdate.fnnas.com/?platform=${platform}" | head -c -256 | jq -r '.packages[] | select(.packageName=="trim")')
 dlkey=$(echo "$data" | jq -r '.dlkey')
 url=$(echo "$data" | jq -r '.url')
 version=$(echo "$data" | jq -r '.version')
@@ -356,19 +379,54 @@ tar -C mediasrv -xvf data.tar.xz \
  ./usr/trim/lib/libppjson.so \
  --strip-components=3
 
-curl -O https://dl.google.com/go/go1.26.8.linux-amd64.tar.gz
-tar -xvf go1.26.8.linux-amd64.tar.gz
+rm -rf debian-binary control.tar.xz data.tar.xz "$filename"
+
+case "$arch" in
+  amd64)
+    objdump=(objdump -M intel)
+    range=0xad
+    pattern='(?:xor\s+esi,esi|mov\s+esi,0x\K[0-9a-f]+)'
+    ;;
+  arm64)
+    objdump=(aarch64-linux-gnu-objdump)
+    range=0x150
+    pattern='mov\s+w1,\s*#0x\K[0-9a-f]+|mov\s+w1,\s*#\K[0-9]+'
+    ;;
+esac
+
+addr="0x$($objdump -T "mediasrv/bin/mediasrv" | grep get_srv_version | awk '{print $1}' | sed 's/^0*//')"
+
+version=$("${objdump[@]}" -d --start-address="$addr" --stop-address=$((addr + range)) "mediasrv/bin/mediasrv" \
+  | grep -oP "$pattern" \
+  | sed 's/^$/0/' \
+  | awk '{printf "%s%d", (NR>1?".":""), strtonum("0x"$0)} END{print ""}')
+
+echo mediasrv version is $version
+
+curl -O https://dl.google.com/go/go1.27.1.linux-amd64.tar.gz
+tar -xvf go1.27.1.linux-amd64.tar.gz
 PATH=$PWD/go/bin:$PATH
 go env -w GOPROXY=https://goproxy.cn,direct
 go env -w GOSUMDB=sum.golang.org
 go mod init fakebroker
 go get golang.org/x/sys@v0.48.0
-CGO_ENABLED=0
-GOOS=linux
-GOARCH=amd64
-go build -trimpath -ldflags="-s -w -buildid=" -o mediasrv/bin/rpcbroker fakebroker.go
+CGO_ENABLED=0 GOOS=linux GOARCH=${arch} go build -trimpath -ldflags="-s -w -buildid=" -o mediasrv/bin/rpcbroker fakebroker.go
 
 touch -m -d "@1785140947" mediasrv/bin/rpcbroker
+
+barch=$(file -b mediasrv/bin/rpcbroker | grep -oP '(x86-64|aarch64)' | head -1)
+
+case "$arch" in
+  amd64)  expect="x86-64" ;;
+  arm64)  expect="aarch64" ;;
+esac
+
+if [ "$barch" != "$expect" ]; then
+  echo "Architecture mismatch: expected $expect, but got $barch" >&2
+  exit 1
+fi
+
+echo buildid executable $expect bin file
 
 find mediasrv -type d | while read dir; do
   newest=$(find "$dir" -maxdepth 1 -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)
@@ -380,5 +438,7 @@ done
 touch -m -r "$(find mediasrv -type f -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)" mediasrv/etc
 touch -m -r "$(find mediasrv -type f -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)" mediasrv
 
-tar --sort=name --owner=0 --group=0 --numeric-owner -C mediasrv -czf mediasrv.tgz .
-touch -m -r mediasrv mediasrv.tgz
+tar --sort=name --owner=0 --group=0 --numeric-owner -C mediasrv -czf mediasrv-${arch}.tgz .
+touch -m -r mediasrv mediasrv-${arch}.tgz
+
+rm -rf mediasrv go* fakebroker.go

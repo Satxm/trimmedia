@@ -89,7 +89,16 @@ docker pull satxm/trimmedia:latest # docker hub
 
 ### 自动下载：
 
-以管理员身份运行 `files` 文件夹下的 `mediasrv.sh` 和 `trim-media.sh` 脚本，生成 `mediasrv.tgz` 和 `trim.media.tgz` 文件。
+以管理员身份运行当前文件夹下的 `mediasrv.sh` 和 `trim-media.sh` 脚本，生成 `mediasrv.tgz` 和 `trim.media.tgz` 文件。
+
+### 执行构建：
+
+将上述 tgz 压缩包及 `Dockerfile` 放在同一目录下，执行：
+
+```bash
+docker build --platform linux/amd64 --no-cache -t trimmedia:amd64 -f Dockerfile-amd64 .
+docker build --platform linux/arm64 --no-cache -t trimmedia:arm64 -f Dockerfile-arm64 .
+```
 
 ### 准备文件：
 
@@ -124,14 +133,6 @@ go build -o mediasrv/bin/rpcbroker fakebroker.go
 ```bash
 tar -C mediasrv -czvf mediasrv.tgz .
 tar -C trim.media -czvf trim.media.tgz .
-```
-
-### 执行构建：
-
-将上述 tgz 压缩包及 `Dockerfile` 放在同一目录下，执行：
-
-```bash
-docker build--platform linux/amd64 --no-cache -t trimmedia .
 ```
 
 ## 参考来源

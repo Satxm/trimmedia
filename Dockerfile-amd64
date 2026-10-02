@@ -1,25 +1,322 @@
-#!/bin/bash
+FROM debian:bookworm AS builder
 
-arch="${1:-amd64}"
+RUN cat > fakebroker.go <<'EOF'
+package main
 
-case "$arch" in
-  amd64)
-    platform="x86"
-    ;;
-  arm64)
-    platform="arm"
-    ;;
-  *)
-    echo "Usage: $0 {amd64|arm64}"
-    exit 1
-    ;;
-esac
+import (
+  "bytes"
+  "encoding/binary"
+  "encoding/json"
+  "flag"
+  "fmt"
+  "io"
+  "log"
+  "net"
+  "net/http"
+  "os"
+  "path"
+  "path/filepath"
+  "strings"
+  "golang.org/x/sys/unix"
+)
 
-echo "Building for platform: $arch"
+const (
+  appCenterAddr  = "/run/com.trim.app.center.sock"
+  brokerAddr     = "/run/trim_app_cgi/rpcbroker"
+  defaultToken   = "reserved"
+  magicNumber    = "CPRT" // magic number for rpc protocol
+  headerSize     = 80
+  payloadLenPos  = 18
+  payloadLenSize = 2
+)
 
-set -eux
+type (
+  Service struct {
+    Id    string `json:"id"`
+    Name  string `json:"name"`
+    IP    string `json:"ip"`
+    Uds   string `json:"uds"`
+    Type  int    `json:"type"`
+    Token string `json:"token"`
+  }
 
-cat > media.sql <<"EOF" && touch -m -d "@1790427542" media.sql
+  Request struct {
+    Header []byte `json:"-"`
+    Data   struct {
+      Uid      uint32   `json:"uid"`
+      Pid      uint32   `json:"pid"`
+      Req      string   `json:"req"`
+      ReqId    string   `json:"reqid"`
+      AppName  string   `json:"appName"`
+      UserName string   `json:"user"`
+      Services []string `json:"services,omitempty"`
+    } `json:"data"`
+  }
+
+  BaseResp struct {
+    Data   any    `json:"data,omitempty"`
+    ReqId  string `json:"reqid"`
+    Result string `json:"result"`
+    Rev    string `json:"rev"`
+    Req    string `json:"req,omitempty"`
+  }
+
+  Response struct {
+    Data BaseResp `json:"data"`
+  }
+
+  AppAuthorizedDir struct {
+    Type     int    `json:"storageType"`
+    Path     string `json:"path"`
+    UserName string `json:"uname"`
+  }
+
+  AuthPath struct {
+    Editable bool   `json:"isEditable"`
+    Perm     int    `json:"perm"`
+    Status   int    `json:"status"`
+    Path     string `json:"path"`
+  }
+)
+
+var (
+  username          string
+  logPath           string
+  folders           string
+  authPathResp      []byte
+  appAuthorizedDirs []AppAuthorizedDir
+  marshaledUserId   = json.RawMessage(`{"uid": 1000}`)
+  marshaledVolsInfo json.RawMessage
+
+  services = []Service{
+    {Id: "com.trim.main", Name: "TRIM Service", Uds: brokerAddr, Token: defaultToken, Type: 1},
+    {Id: "com.trim.sysinfo", Name: "System Info Provider Service", Uds: brokerAddr, Token: defaultToken},
+    {Id: "com.trim.filestor", Name: "File Storage Service", Uds: brokerAddr, Token: defaultToken},
+    {Id: "com.trim.usersrv", Name: "User Service", Uds: brokerAddr, Token: defaultToken},
+  }
+)
+
+func GetAvailableSpace(pathStr string) (uint64, error) {
+  absPath, err := filepath.Abs(pathStr)
+  if err != nil {
+    return 0, fmt.Errorf("failed to get absolute path: %w", err)
+  }
+  absPath, err = filepath.EvalSymlinks(absPath)
+  if err != nil {
+    return 0, fmt.Errorf("failed to resolve symbolic link: %w", err)
+  }
+  var stat unix.Statfs_t
+  if err := unix.Statfs(pathStr, &stat); err != nil {
+    return 0, fmt.Errorf("statfs call failed: %w", err)
+  }
+  return stat.Bavail * uint64(stat.Bsize), nil
+}
+
+func init() {
+  flag.StringVar(&username, "u", "admin", "user name")
+  flag.StringVar(&logPath, "p", "/var/log/rpcbroker.log", "log file path")
+  flag.StringVar(&folders, "f", "/vol1/1000/media:", "media folders")
+  flag.Parse()
+
+  splited := strings.Split(folders, ":")
+  appAuthorizedDirs = make([]AppAuthorizedDir, 0, len(splited))
+  authPaths := make([]AuthPath, 0, len(splited))
+
+  for _, v := range splited {
+    if strings.TrimSpace(v) == "" {
+      continue
+    }
+    appAuthorizedDirs = append(appAuthorizedDirs, AppAuthorizedDir{Path: v, Type: 3, UserName: username})
+    authPaths = append(authPaths, AuthPath{Path: v, Perm: 6, Editable: true})
+  }
+  authPathResp, _ = json.Marshal(map[string]any{"code": 0, "msg": "", "data": map[string][]AuthPath{"list": authPaths}})
+}
+
+  func getLatestVolsInfo() json.RawMessage {
+    var availableSize uint64 = 137438953472 // 默认兜底值 (128 GB)
+
+    splited := strings.Split(folders, ":")
+    for _, v := range splited {
+      if strings.TrimSpace(v) == "" {
+        continue
+      }
+      size, err := GetAvailableSpace(v)
+      if err == nil {
+        availableSize = size
+        break
+      }
+    }
+
+    return json.RawMessage(fmt.Sprintf(
+      `{"vols":[{"index":1,"state":0,"sysname":"dm-0","uuid":"trim_00000000_1111_2222_3333_444444444444-0","size":%d,"used":0,"voltype":61267}],"count":1}`,
+      availableSize,
+    ))
+  }
+
+func NewResp(req *Request, data any) BaseResp {
+  return BaseResp{ReqId: req.Data.ReqId, Req: req.Data.Req, Data: data, Result: "succ", Rev: "0.1"}
+}
+
+func NewErrorResp(req *Request) BaseResp {
+  return BaseResp{ReqId: req.Data.ReqId, Req: req.Data.Req, Result: "fail", Rev: "0.1"}
+}
+
+func readHeader(conn net.Conn) ([]byte, error) {
+  header := make([]byte, headerSize)
+  _, err := io.ReadFull(conn, header)
+  if err != nil {
+    return nil, err
+  }
+
+  if !bytes.Equal(header[:4], []byte(magicNumber)) {
+    return nil, fmt.Errorf("invalid magic number: %x", header[:4])
+  }
+
+  return header, nil
+}
+
+func parseRequest(conn net.Conn) (*Request, error) {
+  header, err := readHeader(conn)
+  if err != nil {
+    log.Printf("read header error from %s: %v\n", conn.RemoteAddr(), err)
+    return nil, err
+  }
+
+  plLen := getPayloadLength(header)
+  payload, err := readPayload(conn, plLen)
+  if err != nil {
+    log.Println("header:", string(header))
+    log.Printf("read payload error from %s: %v\n", conn.RemoteAddr(), err)
+    log.Println("payload:", string(payload))
+    return nil, err
+  }
+
+  var req Request
+  if err := json.Unmarshal(payload, &req); err != nil {
+    log.Println(string(payload))
+    return nil, fmt.Errorf("unmarshal payload failed: %w", err)
+  }
+
+  log.Println("request:", string(payload))
+  req.Header = header
+  return &req, nil
+}
+
+func getPayloadLength(header []byte) uint16 {
+  return binary.LittleEndian.Uint16(header[payloadLenPos : payloadLenPos+payloadLenSize])
+}
+
+func readPayload(conn net.Conn, length uint16) ([]byte, error) {
+  if length == 0 {
+    return nil, fmt.Errorf("payload len is zero")
+  }
+  payload := make([]byte, length)
+  _, err := io.ReadFull(conn, payload)
+  return payload, err
+}
+
+func writeResponse(conn net.Conn, header []byte, payload []byte) error {
+  length := uint16(len(payload))
+  binary.LittleEndian.PutUint16(header[payloadLenPos:payloadLenPos+payloadLenSize], length)
+  _, err := conn.Write(append(header, payload...))
+  return err
+}
+
+func processRequest(req *Request) BaseResp {
+  switch req.Data.Req {
+  case "com.trim.rpcbroker.apply":
+    return NewResp(req, services)
+
+  case "com.trim.usersrv.getUserId", "com.trim.sysinfo.getUserId":
+    return NewResp(req, marshaledUserId)
+
+  case "com.trim.filestor.getAppAuthorizedDir":
+    return NewResp(req, appAuthorizedDirs)
+
+  case "com.trim.sysinfo.getAllVolsInfo":
+    return NewResp(req, getLatestVolsInfo()) 
+
+  default:
+    log.Println("unknown req:", req.Data.Req)
+    return NewErrorResp(req)
+  }
+}
+
+func handleConnection(conn net.Conn) {
+  defer conn.Close()
+  addr := conn.RemoteAddr()
+
+  log.Printf("client %s connected\n", addr)
+
+  for {
+    req, err := parseRequest(conn)
+    if err != nil {
+      log.Printf("read request error from %s: %v\n", addr, err)
+      return
+    }
+
+    resp := processRequest(req)
+
+    data, _ := json.Marshal(Response{Data: resp})
+    log.Println("response:", string(data))
+    if err := writeResponse(conn, req.Header, data); err != nil {
+      log.Printf("write resp error: %v\n", err)
+      return
+    }
+  }
+}
+
+func main() {
+  log.SetFlags(log.LstdFlags | log.Lshortfile)
+  logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+  if err != nil {
+    log.Fatalf("cannot open log file: %s: %v", logPath, err)
+  }
+  defer logFile.Close()
+  log.SetOutput(logFile)
+
+  // start auth http server
+  os.RemoveAll(appCenterAddr)
+  al, err := net.Listen("unix", appCenterAddr)
+  if err != nil {
+    log.Fatalf("cannot listen http unix: %v", err)
+  }
+  defer al.Close()
+
+  http.HandleFunc("/rpc/v1/sysconfig/app/auth-path", func(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    w.Write(authPathResp)
+  })
+
+  go func() {
+    log.Println("app center serve:", http.Serve(al, nil))
+  }()
+
+  // start rpc broker
+  os.Remove(brokerAddr)
+  os.MkdirAll(path.Dir(brokerAddr), 0755)
+
+  listener, err := net.Listen("unix", brokerAddr)
+  if err != nil {
+    log.Fatalf("listen rpc broker %s failed: %v", brokerAddr, err)
+  }
+  defer listener.Close()
+
+  log.Printf("rpc broker listening on %s\n", brokerAddr)
+
+  for {
+    conn, err := listener.Accept()
+    if err != nil {
+      log.Printf("accept error: %v\n", err)
+      continue
+    }
+    go handleConnection(conn)
+  }
+}
+
+EOF
+
+RUN cat > media.sql <<"EOF" && touch -m -d "@1790427542" media.sql
 PRAGMA foreign_keys=OFF;
 BEGIN TRANSACTION;
 CREATE TABLE `item` (`guid` text,`trim_id` text,`imdb_id` text,`tmdb_id` integer,`pinyin` text,`type` text,`lan` text,`title` text,`sort_title` text,`sort_num` integer DEFAULT 2147483647,`original_title` text,`overview` text,`adult` integer NOT NULL DEFAULT 0,`runtime` integer,`release_date` text,`parent_guid` text,`alternative_titles` text,`backdrops` text,`backdrop_height` integer DEFAULT 0,`backdrop_width` integer DEFAULT 0,`backdrop_height_width_try` integer DEFAULT 0,`logos` text,`posters` text,`poster_height` integer DEFAULT 0,`poster_width` integer DEFAULT 0,`poster_height_width_try` integer DEFAULT 0,`production_countries` text,`external_ids` text,`origin_country` text,`content_ratings` text,`first_air_date` text,`last_air_date` text,`air_date` text,`vote_average` real,`vote_count` integer,`number_of_seasons` integer,`number_of_episodes` integer,`status` text DEFAULT "1",`season_number` integer,`episode_number` integer,`still_path` text,`keywords` text,`path` text,`fetch_status` integer,`logic_type` integer DEFAULT 0,`dir` text,`filename` text,`episode_imdb_id` text,`create_time` integer,`update_time` integer, `poster_type` integer DEFAULT 0, `nfo_path` text DEFAULT "",PRIMARY KEY (`guid`));
@@ -116,7 +413,7 @@ CREATE UNIQUE INDEX uk_item_tag ON item_tag(item_guid, tag, type);
 COMMIT;
 EOF
 
-cat > start.sh <<'EOF' && chmod +x start.sh && touch -m -d "@1790560760" "start.sh"
+RUN cat > start.sh <<'EOF' && chmod +x start.sh && touch -m -d "@1790560760" start.sh
 #!/bin/bash
 
 set -euxm
@@ -171,9 +468,84 @@ exit $exit_code
 
 EOF
 
-command -v curl >/dev/null 2>&1 || sudo apt install -y curl
-command -v jq >/dev/null 2>&1 || sudo apt install -y jq
-command -v openssl >/dev/null 2>&1 || sudo apt install -y openssl
+RUN apt update && apt install -y curl jq gawk openssl binutils xz-utils
+
+RUN cat > mediasrv.sh <<'EOF' && chmod +x mediasrv.sh && /bin/bash mediasrv.sh
+#!/bin/bash
+set -eux
+
+command -v curl >/dev/null 2>&1 || apt install -y curl
+command -v jq >/dev/null 2>&1 || apt install -y jq
+command -v ar >/dev/null 2>&1 || apt install -y binutils
+command -v gawk >/dev/null 2>&1 || apt install -y gawk
+command -v xz >/dev/null 2>&1 || apt install -y xz-utils
+
+data=$(curl -sS "https://apiv2-liveupdate.fnnas.com/?platform=x86" | head -c -256 | jq -r '.packages[] | select(.packageName=="trim")')
+dlkey=$(echo "$data" | jq -r '.dlkey')
+url=$(echo "$data" | jq -r '.url')
+version=$(echo "$data" | jq -r '.version')
+description=$(echo "$data" | jq -r '.description')
+filename=$(basename $url)
+t=$(date +%s)
+
+bytes=$(printf '%s' "$dlkey" | base64 -d 2>/dev/null | od -An -tx1 | tr -s ' ' '\n' | sed '/^$/d')
+secret=$(printf '%s\n' "$bytes" | gawk '{for(i=1;i<=NF;i++) printf "%c", xor(strtonum("0x"$i), 94)}')
+path=$(sed -E 's#^[^/]*//[^/]*([^?]*)?.*$#\1#' <<< "$url")
+
+sign=$(printf '%s' "${secret}${path}${t}" | md5sum | awk '{print $1}')
+url="${url}?sign=${sign}&t=${t}"
+
+curl -fL -C - -R -O "$url"
+
+ar x "$filename"
+mkdir -p mediasrv mediasrv/etc
+
+tar -C mediasrv -xvf data.tar.xz \
+ ./usr/trim/bin/mediasrv \
+ ./usr/trim/lib/mediasrv \
+ ./usr/trim/lib/libhwinfo.so \
+ ./usr/trim/lib/libhwinfo.so.0 \
+ ./usr/trim/lib/libhwinfo.so.0.8 \
+ ./usr/trim/lib/libigputop.so \
+ ./usr/trim/lib/libigputop.so.0 \
+ ./usr/trim/lib/libigputop.so.0.7 \
+ ./usr/trim/lib/libnebula.so \
+ ./usr/trim/lib/libppjson.so \
+ --strip-components=3
+
+curl -O https://dl.google.com/go/go1.26.8.linux-amd64.tar.gz
+tar -xvf go1.26.8.linux-amd64.tar.gz
+PATH=$PWD/go/bin:$PATH
+go env -w GOPROXY=https://goproxy.cn,direct
+go env -w GOSUMDB=sum.golang.org
+go mod init fakebroker
+go get golang.org/x/sys@v0.48.0
+CGO_ENABLED=0
+GOOS=linux
+GOARCH=amd64
+go build -trimpath -ldflags="-s -w -buildid=" -o mediasrv/bin/rpcbroker fakebroker.go
+
+touch -m -d "@1785140947" mediasrv/bin/rpcbroker
+
+find mediasrv -type d | while read dir; do
+  newest=$(find "$dir" -maxdepth 1 -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)
+  if [ -n "$newest" ]; then
+    touch -m -r "$newest" "$dir"
+  fi
+done
+
+touch -m -r "$(find mediasrv -type f -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)" mediasrv/etc
+touch -m -r "$(find mediasrv -type f -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)" mediasrv
+
+EOF
+
+RUN cat > trim-media.sh <<'EOF' && chmod +x trim-media.sh && /bin/bash trim-media.sh
+#!/bin/bash
+set -eux
+
+command -v curl >/dev/null 2>&1 || apt install -y curl
+command -v jq >/dev/null 2>&1 || apt install -y jq
+command -v openssl >/dev/null 2>&1 || apt install -y openssl
 
 appname="trim.media"
 
@@ -182,7 +554,7 @@ headers=(
   -H "Trim-Language: zh-CN"
   -H "Trim-Machine-Id: 601e3a4be3354fc3aa7ecadbae2e0b1cd329fd02"
   -H "Trim-Os-Version: 1.2.0604"
-  -H "Trim-Platform: ${platform}"
+  -H "Trim-Platform: x86"
   -H "Content-Type: application/json"
 )
 
@@ -191,7 +563,6 @@ detail=$(curl -sS "${headers[@]}" -X GET -d "$detailbody" "https://aps.fnnas.com
 
 version=$(echo "$detail" | jq -r '.data.lastVersion')
 appid=$(echo "$detail" | jq -r '.data.appId')
-changeLog=$(echo "$detail" | jq -r '.data.changeLog' | sed 's|<br/>|\n|g')
 
 applynody='{"appId":'"$appid"',"version":"'"$version"'","auth":"'"031c4865-b193-44c0-bfa6-a20d2994ea20"'"}'
 apply=$(curl -sS "${headers[@]}" -X POST -d "$applynody" "https://aps.fnnas.com/api/v1/app/apply")
@@ -211,7 +582,6 @@ iv="${key:0:32}"
 
 openssl enc -aes-256-cfb -d -K "$key" -iv "$iv" -in "$filename" -out "${appname}_${version}_decrypt.tar" -nosalt
 dd if=/dev/zero of="${appname}_${version}_decrypt.tar" bs=512 count=4 oflag=append conv=notrunc
-touch -m -r "$filename" "${appname}_${version}_decrypt.tar"
 
 mkdir -p "${appname}" "${appname}/target"
 tar -C "${appname}" -xvf "${appname}_${version}_decrypt.tar" --exclude="app.tgz"
@@ -220,9 +590,42 @@ tar -C "${appname}/target" -xvf "app.tgz"
 
 mv start.sh media.sql "${appname}/"
 
-touch -m -r "$(find ${appname} -maxdepth 1 -mindepth 1 -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)" "${appname}"
+touch -m -r "$(find trim.media -maxdepth 1 -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)" trim.media
 
-tar --sort=name --owner=0 --group=0 --numeric-owner -C "${appname}" -czf "${appname}-${arch}.tgz" .
-touch -m -r "${appname}" "${appname}-${arch}.tgz"
+EOF
 
-rm -rf "$appname" "$filename" "${appname}_${version}_decrypt.tar" app.tgz
+# ====== end of builder ======
+
+# ======  final stage   ======
+FROM debian:bookworm
+
+ENV LD_LIBRARY_PATH=/usr/trim/lib/mediasrv \
+    LOG_LEVEL=info \
+    MEDIA_DIRS=/vol1/1000/media \
+    USER_NAME=admin \
+    PUID=1000 \
+    GUID=1000
+
+RUN apt update && \
+    apt install -y \
+        sqlite3 openssl ca-certificates \
+        libass9 libbluray2 libmp3lame0 libopenmpt0 libopus0 \
+        libtcmalloc-minimal4 libtheora0 libvorbisenc2 libvpx7 \
+        libwebp7 libpci3 libwebpmux3 libx264-164 libx265-199 \
+        libzvbi0 libjemalloc2 ocl-icd-libopencl1 intel-opencl-icd \
+        clinfo && \
+    apt clean && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /mediasrv /usr/trim
+COPY --from=builder /trim.media /var/apps/trim.media
+
+VOLUME ["/vol1/1000/media", "/vol1/@appdata/trim.media", "/vol1/@appmeta/trim.media"]
+
+WORKDIR /var/apps/trim.media
+
+EXPOSE 8005
+
+ENTRYPOINT ["/var/apps/trim.media/start.sh"]
+
+CMD []
