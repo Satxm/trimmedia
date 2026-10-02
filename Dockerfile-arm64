@@ -316,7 +316,7 @@ func main() {
 
 EOF
 
-RUN cat > media.sql <<"EOF" && touch -m -d "@1790427542" "media.sql"
+RUN cat > media.sql <<"EOF" && touch -m -d "@1790427542" media.sql
 PRAGMA foreign_keys=OFF;
 BEGIN TRANSACTION;
 CREATE TABLE `item` (`guid` text,`trim_id` text,`imdb_id` text,`tmdb_id` integer,`pinyin` text,`type` text,`lan` text,`title` text,`sort_title` text,`sort_num` integer DEFAULT 2147483647,`original_title` text,`overview` text,`adult` integer NOT NULL DEFAULT 0,`runtime` integer,`release_date` text,`parent_guid` text,`alternative_titles` text,`backdrops` text,`backdrop_height` integer DEFAULT 0,`backdrop_width` integer DEFAULT 0,`backdrop_height_width_try` integer DEFAULT 0,`logos` text,`posters` text,`poster_height` integer DEFAULT 0,`poster_width` integer DEFAULT 0,`poster_height_width_try` integer DEFAULT 0,`production_countries` text,`external_ids` text,`origin_country` text,`content_ratings` text,`first_air_date` text,`last_air_date` text,`air_date` text,`vote_average` real,`vote_count` integer,`number_of_seasons` integer,`number_of_episodes` integer,`status` text DEFAULT "1",`season_number` integer,`episode_number` integer,`still_path` text,`keywords` text,`path` text,`fetch_status` integer,`logic_type` integer DEFAULT 0,`dir` text,`filename` text,`episode_imdb_id` text,`create_time` integer,`update_time` integer, `poster_type` integer DEFAULT 0, `nfo_path` text DEFAULT "",PRIMARY KEY (`guid`));
@@ -413,7 +413,7 @@ CREATE UNIQUE INDEX uk_item_tag ON item_tag(item_guid, tag, type);
 COMMIT;
 EOF
 
-RUN cat > start.sh <<'EOF' && chmod +x start.sh && touch -m -d "@1790560760" "start.sh"
+RUN cat > start.sh <<'EOF' && chmod +x start.sh && touch -m -d "@1790560760" start.sh
 #!/bin/bash
 
 set -euxm
@@ -480,7 +480,7 @@ command -v ar >/dev/null 2>&1 || apt install -y binutils
 command -v gawk >/dev/null 2>&1 || apt install -y gawk
 command -v xz >/dev/null 2>&1 || apt install -y xz-utils
 
-data=$(curl -sS "https://apiv2-liveupdate.fnnas.com/" | head -c -256 | jq -r '.packages[] | select(.packageName=="trim")')
+data=$(curl -sS "https://apiv2-liveupdate.fnnas.com/?platform=arm" | head -c -256 | jq -r '.packages[] | select(.packageName=="trim")')
 dlkey=$(echo "$data" | jq -r '.dlkey')
 url=$(echo "$data" | jq -r '.url')
 version=$(echo "$data" | jq -r '.version')
@@ -513,8 +513,8 @@ tar -C mediasrv -xvf data.tar.xz \
  ./usr/trim/lib/libppjson.so \
  --strip-components=3
 
-curl -O https://dl.google.com/go/go1.26.8.linux-amd64.tar.gz
-tar -xvf go1.26.8.linux-amd64.tar.gz
+curl -O https://dl.google.com/go/go1.26.8.linux-arm64.tar.gz
+tar -xvf go1.26.8.linux-arm64.tar.gz
 PATH=$PWD/go/bin:$PATH
 go env -w GOPROXY=https://goproxy.cn,direct
 go env -w GOSUMDB=sum.golang.org
@@ -522,7 +522,7 @@ go mod init fakebroker
 go get golang.org/x/sys@v0.48.0
 CGO_ENABLED=0
 GOOS=linux
-GOARCH=amd64
+GOARCH=arm64
 go build -trimpath -ldflags="-s -w -buildid=" -o mediasrv/bin/rpcbroker fakebroker.go
 
 touch -m -d "@1785140947" mediasrv/bin/rpcbroker
@@ -554,7 +554,7 @@ headers=(
   -H "Trim-Language: zh-CN"
   -H "Trim-Machine-Id: 601e3a4be3354fc3aa7ecadbae2e0b1cd329fd02"
   -H "Trim-Os-Version: 1.2.0604"
-  -H "Trim-Platform: x86"
+  -H "Trim-Platform: arm"
   -H "Content-Type: application/json"
 )
 
@@ -607,13 +607,13 @@ ENV LD_LIBRARY_PATH=/usr/trim/lib/mediasrv \
     GUID=1000
 
 RUN apt update && \
-    apt install -y \
+    apt install -y --no-install-recommends \
         sqlite3 openssl ca-certificates \
         libass9 libbluray2 libmp3lame0 libopenmpt0 libopus0 \
         libtcmalloc-minimal4 libtheora0 libvorbisenc2 libvpx7 \
         libwebp7 libpci3 libwebpmux3 libx264-164 libx265-199 \
-        libzvbi0 libjemalloc2 ocl-icd-libopencl1 intel-opencl-icd \
-        clinfo && \
+        libzvbi0 libjemalloc2 ocl-icd-libopencl1 \
+        libdrm2 libva2 libva-drm2 clinfo && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
