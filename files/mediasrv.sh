@@ -17,7 +17,7 @@ esac
 
 echo "Building for platform: $arch"
 
-set -eux
+set -eu
 
 cat > fakebroker.go <<'EOF'
 package main
@@ -366,7 +366,7 @@ curl -fL -C - -R -O "$url"
 ar x "$filename"
 mkdir -p mediasrv mediasrv/etc
 
-tar -C mediasrv -xvf data.tar.xz \
+tar -C mediasrv -xf data.tar.xz \
  ./usr/trim/bin/mediasrv \
  ./usr/trim/lib/mediasrv \
  ./usr/trim/lib/libhwinfo.so \
@@ -404,7 +404,7 @@ version=$("${objdump[@]}" -d --start-address="$addr" --stop-address=$((addr + ra
 echo mediasrv version is $version
 
 curl -O https://dl.google.com/go/go1.27.1.linux-amd64.tar.gz
-tar -xvf go1.27.1.linux-amd64.tar.gz
+tar -xf go1.27.1.linux-amd64.tar.gz
 PATH=$PWD/go/bin:$PATH
 go env -w GOPROXY=https://goproxy.cn,direct
 go env -w GOSUMDB=sum.golang.org

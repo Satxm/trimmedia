@@ -16,7 +16,8 @@ RUN apt update && \
         libtcmalloc-minimal4 libtheora0 libvorbisenc2 libvpx7 \
         libwebp7 libwebpmux3 libx264-164 libx265-199 libzvbi0 \
         libpci3 libjemalloc2 ocl-icd-libopencl1 libdrm2 \
-        libva2 libva-drm2 clinfo && \
+        libva2 libva-drm2 clinfo \
+        $(if [ "$TARGETARCH" = "amd64" ]; then echo "intel-opencl-icd"; fi) && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 

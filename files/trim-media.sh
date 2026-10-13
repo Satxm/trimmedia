@@ -17,7 +17,7 @@ esac
 
 echo "Building for platform: $arch"
 
-set -eux
+set -eu
 
 cat > media.sql <<"EOF" && touch -m -d "@1790427542" media.sql
 PRAGMA foreign_keys=OFF;
@@ -214,9 +214,9 @@ dd if=/dev/zero of="${appname}_${version}_decrypt.tar" bs=512 count=4 oflag=appe
 touch -m -r "$filename" "${appname}_${version}_decrypt.tar"
 
 mkdir -p "${appname}" "${appname}/target"
-tar -C "${appname}" -xvf "${appname}_${version}_decrypt.tar" --exclude="app.tgz"
-tar -xvf "${appname}_${version}_decrypt.tar" "app.tgz"
-tar -C "${appname}/target" -xvf "app.tgz"
+tar -C "${appname}" -xf "${appname}_${version}_decrypt.tar" --exclude="app.tgz"
+tar -xf "${appname}_${version}_decrypt.tar" "app.tgz"
+tar -C "${appname}/target" -xf "app.tgz"
 
 mv start.sh media.sql "${appname}/"
 
