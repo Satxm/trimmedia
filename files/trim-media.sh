@@ -1,25 +1,23 @@
 #!/bin/bash
 
+set -euo pipefail
+
 arch="${1:-amd64}"
 
 case "$arch" in
-  amd64)
-    platform="x86"
-    ;;
-  arm64)
-    platform="arm"
-    ;;
-  *)
-    echo "Usage: $0 {amd64|arm64}"
-    exit 1
-    ;;
+    amd64) platform="x86" ;;
+    arm64) platform="arm" ;;
+    *) echo "Usage: $0 {amd64|arm64}" >&2; exit 1 ;;
 esac
 
 echo "Building for platform: $arch"
 
-set -eu
+sudo apt update -qq
+for pkg in curl jq openssl coreutils tar; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || sudo apt install -y -qq "$pkg"
+done
 
-cat > media.sql <<"EOF" && touch -m -d "@1790427542" media.sql
+cat > media.sql <<"SQLEOF" && touch -m -d "@1790427542" media.sql
 PRAGMA foreign_keys=OFF;
 BEGIN TRANSACTION;
 CREATE TABLE `item` (`guid` text,`trim_id` text,`imdb_id` text,`tmdb_id` integer,`pinyin` text,`type` text,`lan` text,`title` text,`sort_title` text,`sort_num` integer DEFAULT 2147483647,`original_title` text,`overview` text,`adult` integer NOT NULL DEFAULT 0,`runtime` integer,`release_date` text,`parent_guid` text,`alternative_titles` text,`backdrops` text,`backdrop_height` integer DEFAULT 0,`backdrop_width` integer DEFAULT 0,`backdrop_height_width_try` integer DEFAULT 0,`logos` text,`posters` text,`poster_height` integer DEFAULT 0,`poster_width` integer DEFAULT 0,`poster_height_width_try` integer DEFAULT 0,`production_countries` text,`external_ids` text,`origin_country` text,`content_ratings` text,`first_air_date` text,`last_air_date` text,`air_date` text,`vote_average` real,`vote_count` integer,`number_of_seasons` integer,`number_of_episodes` integer,`status` text DEFAULT "1",`season_number` integer,`episode_number` integer,`still_path` text,`keywords` text,`path` text,`fetch_status` integer,`logic_type` integer DEFAULT 0,`dir` text,`filename` text,`episode_imdb_id` text,`create_time` integer,`update_time` integer, `poster_type` integer DEFAULT 0, `nfo_path` text DEFAULT "",PRIMARY KEY (`guid`));
@@ -114,9 +112,9 @@ CREATE INDEX `idx_nfo_path` ON `item`(`nfo_path`);
 CREATE INDEX `idx_type` ON `custom_tag`(`type`);
 CREATE UNIQUE INDEX uk_item_tag ON item_tag(item_guid, tag, type);
 COMMIT;
-EOF
+SQLEOF
 
-cat > start.sh <<'EOF' && chmod +x start.sh && touch -m -d "@1790560760" "start.sh"
+cat > start.sh <<'STARTEOF' && chmod +x start.sh && touch -m -d "@1790560760" start.sh
 #!/bin/bash
 
 set -euxm
@@ -134,7 +132,7 @@ trap shutdown SIGINT SIGTERM
 pid1=$!
 
 # start rpcbroker
-/usr/trim/bin/rpcbroker -u ${USER_NAME} -f ${MEDIA_DIRS} &
+/usr/trim/bin/rpcbroker -u "${USER_NAME}" -f "${MEDIA_DIRS}" &
 pid2=$!
 
 # init database
@@ -144,8 +142,8 @@ if [ ! -f /vol1/@appdata/trim.media/database/trimmedia.db ]; then
   sed "s/___USER_NAME___/${USER_NAME}/g" /var/apps/trim.media/media.sql | sqlite3 /vol1/@appdata/trim.media/database/trimmedia.db
 fi
 
-# change owner
-chown -R ${PUID}:${GUID} ${MEDIA_DIRS}
+# fix ownership
+chown -R "${PUID}:${GUID}" "${MEDIA_DIRS}"
 
 # start trim-media
 /var/apps/trim.media/target/trim-media --port=8005 \
@@ -169,32 +167,45 @@ kill -9 0
 
 exit $exit_code
 
-EOF
-
-command -v curl >/dev/null 2>&1 || sudo apt install -y curl
-command -v jq >/dev/null 2>&1 || sudo apt install -y jq
-command -v openssl >/dev/null 2>&1 || sudo apt install -y openssl
+STARTEOF
 
 appname="trim.media"
 
 headers=(
-  -H "Trim-Kernel: 6.18.18.c1032-trim-1032"
+  -H "Trim-Kernel: 6.18.18.c1126-trim-1126"
   -H "Trim-Language: zh-CN"
-  -H "Trim-Machine-Id: 601e3a4be3354fc3aa7ecadbae2e0b1cd329fd02"
-  -H "Trim-Os-Version: 1.2.0604"
+  -H "Trim-Machine-Id: ceea7576f0a64a6bba89e8fe50898af9801e1457"
+  -H "Trim-Os-Version: 1.2.0800"
   -H "Trim-Platform: ${platform}"
   -H "Content-Type: application/json"
 )
 
-detailbody="{\"appName\":\"$appname\"}"
-detail=$(curl -sS "${headers[@]}" -X GET -d "$detailbody" "https://aps.fnnas.com/api/v1/app/detail")
+secret="Pn2u9sYpBC77RZtLcRxYoCm8DBQpuj" #后端 (IsFrontend=false) "NDzZTVxnRKP8Z0jXg1VAMonaG8akvh" #前端 (IsFrontend=true)
+apikey="0D072448-9FCF-4227-9584-1BA3BD83DB83"
+auth="14ecf37e-601e-4735-8726-94806e80ac49"
+nonce=$((RANDOM % 900000 + 100000))
+ts=$(date +%s%3N)
+
+detailbody=$(jq -nc --arg name "$appname" '{appName: $name}')
+detailpath="/api/v1/app/detail"
+detailparam="d41d8cd98f00b204e9800998ecf8427e"
+detailinner="${secret}_${detailpath}_${nonce}_${ts}_${detailparam}_${apikey}"
+detailsign=$(echo -n "$detailinner" | md5sum | cut -d' ' -f1)
+detailauthx="nonce=${nonce}&timestamp=${ts}&sign=${detailsign}"
+
+detail=$(curl -sS "${headers[@]}" -H "Authx: ${detailauthx}" -X GET -d "$detailbody" "https://aps.fnnas.com/api/v1/app/detail")
 
 version=$(echo "$detail" | jq -r '.data.lastVersion')
 appid=$(echo "$detail" | jq -r '.data.appId')
-changeLog=$(echo "$detail" | jq -r '.data.changeLog' | sed 's|<br/>|\n|g')
 
-applynody='{"appId":'"$appid"',"version":"'"$version"'","auth":"'"031c4865-b193-44c0-bfa6-a20d2994ea20"'"}'
-apply=$(curl -sS "${headers[@]}" -X POST -d "$applynody" "https://aps.fnnas.com/api/v1/app/apply")
+applybody=$(jq -nc --argjson id "$appid" --arg ver "$version" --arg auth "$auth" '{appId: $id, version: $ver, auth: $auth}')
+applypath="/api/v1/app/apply"
+applyparam=$(echo -n "$applybody" | md5sum | cut -d' ' -f1)
+applyinner="${secret}_${applypath}_${nonce}_${ts}_${applyparam}_${apikey}"
+applysign=$(echo -n "$applyinner" | md5sum | cut -d' ' -f1)
+applyauthx="nonce=${nonce}&timestamp=${ts}&sign=${applysign}"
+
+apply=$(curl -sS "${headers[@]}" -H "Authx: ${applyauthx}" -X POST -d "$applybody" "https://aps.fnnas.com/api/v1/app/apply")
 
 url=$(echo "$apply" | jq -r '.data.downloadLink')
 md5=$(echo "$apply" | jq -r '.data.checkSum')
@@ -209,20 +220,27 @@ input="${appname}${sep}${version}${sep}${encrypt}${sep}trimAppCenter"
 key=$(printf '%s' "$input" | openssl dgst -sha256 -r | cut -d' ' -f1)
 iv="${key:0:32}"
 
-openssl enc -aes-256-cfb -d -K "$key" -iv "$iv" -in "$filename" -out "${appname}_${version}_decrypt.tar" -nosalt
-dd if=/dev/zero of="${appname}_${version}_decrypt.tar" bs=512 count=4 oflag=append conv=notrunc
-touch -m -r "$filename" "${appname}_${version}_decrypt.tar"
+decrypted="${appname}_${version}_${arch}_decrypt.tar"
+
+openssl enc -aes-256-cfb -d -K "$key" -iv "$iv" -in "$filename" -out "$decrypted" -nosalt
+dd if=/dev/zero of="$decrypted" bs=512 count=4 oflag=append conv=notrunc
+touch -m -r "$filename" "$decrypted"
 
 mkdir -p "${appname}" "${appname}/target"
-tar -C "${appname}" -xf "${appname}_${version}_decrypt.tar" --exclude="app.tgz"
-tar -xf "${appname}_${version}_decrypt.tar" "app.tgz"
+tar -C "${appname}" -xf "$decrypted" --exclude="app.tgz"
+tar -xf "$decrypted" "app.tgz"
 tar -C "${appname}/target" -xf "app.tgz"
 
 mv start.sh media.sql "${appname}/"
 
 touch -m -r "$(find ${appname} -maxdepth 1 -mindepth 1 -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)" "${appname}"
 
-tar --sort=name --owner=0 --group=0 --numeric-owner -C "${appname}" -czf "${appname}-${arch}.tgz" .
-touch -m -r "${appname}" "${appname}-${arch}.tgz"
+output="${appname}-${arch}.tgz"
 
-rm -rf "$appname" "$filename" "${appname}_${version}_decrypt.tar" app.tgz
+tar --sort=name --owner=0 --group=0 --numeric-owner -C "${appname}" -czf "$output" .
+touch -m -r "${appname}" "$output"
+
+ls -lh "$output"
+sha256sum "$output"
+
+rm -rf "$appname" "$filename" "$decrypted" app.tgz
