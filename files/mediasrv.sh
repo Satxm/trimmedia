@@ -1,25 +1,25 @@
 #!/bin/bash
+set -euo pipefail
 
 arch="${1:-amd64}"
 
 case "$arch" in
-  amd64)
-    platform="x86"
-    ;;
-  arm64)
-    platform="arm"
-    ;;
-  *)
-    echo "Usage: $0 {amd64|arm64}"
-    exit 1
-    ;;
+    amd64) platform="x86" ;;
+    arm64) platform="arm" ;;
+    *) echo "Usage: $0 {amd64|arm64}" >&2; exit 1 ;;
 esac
 
 echo "Building for platform: $arch"
 
-set -eu
+sudo apt update -qq
+for pkg in curl jq binutils gawk xz-utils; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || sudo apt install -y -qq "$pkg"
+done
+if [ "$arch" = "arm64" ]; then
+    dpkg -s binutils-aarch64-linux-gnu >/dev/null 2>&1 || sudo apt install -y -qq binutils-aarch64-linux-gnu
+fi
 
-cat > fakebroker.go <<'EOF'
+cat > fakebroker.go <<'GOEOF'
 package main
 
 import (
@@ -333,30 +333,19 @@ func main() {
   }
 }
 
-EOF
-
-apt update
-
-command -v curl >/dev/null 2>&1 || apt install -y curl
-command -v jq >/dev/null 2>&1 || apt install -y jq
-command -v ar >/dev/null 2>&1 || apt install -y binutils
-command -v gawk >/dev/null 2>&1 || apt install -y gawk
-command -v xz >/dev/null 2>&1 || apt install -y xz-utils
-if [ "$arch" = "arm64" ]; then
-command -v aarch64-linux-gnu-objdump >/dev/null 2>&1 || apt install -y binutils-aarch64-linux-gnu
-fi
+GOEOF
 
 data=$(curl -sS "https://apiv2-liveupdate.fnnas.com/?platform=${platform}" | head -c -256 | jq -r '.packages[] | select(.packageName=="trim")')
 dlkey=$(echo "$data" | jq -r '.dlkey')
 url=$(echo "$data" | jq -r '.url')
 version=$(echo "$data" | jq -r '.version')
 description=$(echo "$data" | jq -r '.description')
-filename=$(basename $url)
-t=$(date +%s)
+filename=$(basename "$url")
 
 bytes=$(printf '%s' "$dlkey" | base64 -d 2>/dev/null | od -An -tx1 | tr -s ' ' '\n' | sed '/^$/d')
 secret=$(printf '%s\n' "$bytes" | gawk '{for(i=1;i<=NF;i++) printf "%c", xor(strtonum("0x"$i), 94)}')
 path=$(sed -E 's#^[^/]*//[^/]*([^?]*)?.*$#\1#' <<< "$url")
+t=$(date +%s)
 
 sign=$(printf '%s' "${secret}${path}${t}" | md5sum | awk '{print $1}')
 url="${url}?sign=${sign}&t=${t}"
@@ -403,22 +392,29 @@ version=$("${objdump[@]}" -d --start-address="$addr" --stop-address=$((addr + ra
 
 echo mediasrv version is $version
 
-curl -O https://dl.google.com/go/go1.27.1.linux-amd64.tar.gz
-tar -xf go1.27.1.linux-amd64.tar.gz
-PATH=$PWD/go/bin:$PATH
+MIN_GO_VER="1.27.1"
+SYS_GO_VER=$(go version 2>/dev/null | grep -oP 'go\K[0-9]+\.[0-9]+(\.[0-9]+)?' || echo "")
+
+if [ -n "$SYS_GO_VER" ] && [ "$(printf '%s\n%s' "$SYS_GO_VER" "$MIN_GO_VER" | sort -V | head -n1)" = "$MIN_GO_VER" ]; then
+    :
+else
+    curl -sS -O "https://dl.google.com/go/go${MIN_GO_VER}.linux-amd64.tar.gz"
+    tar -xf "go${MIN_GO_VER}.linux-amd64.tar.gz"
+    export PATH=$PWD/go/bin:$PATH
+fi
 go env -w GOPROXY=https://goproxy.cn,direct
 go env -w GOSUMDB=sum.golang.org
 go mod init fakebroker
 go get golang.org/x/sys@v0.48.0
-CGO_ENABLED=0 GOOS=linux GOARCH=${arch} go build -trimpath -ldflags="-s -w -buildid=" -o mediasrv/bin/rpcbroker fakebroker.go
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags="-s -w -buildid=" -o mediasrv/bin/rpcbroker fakebroker.go
 
 touch -m -d "@1785140947" mediasrv/bin/rpcbroker
 
 barch=$(file -b mediasrv/bin/rpcbroker | grep -oP '(x86-64|aarch64)' | head -1)
 
 case "$arch" in
-  amd64)  expect="x86-64" ;;
-  arm64)  expect="aarch64" ;;
+  amd64) expect="x86-64" ;;
+  arm64) expect="aarch64" ;;
 esac
 
 if [ "$barch" != "$expect" ]; then
@@ -430,15 +426,17 @@ echo buildid executable $expect bin file
 
 find mediasrv -type d | while read dir; do
   newest=$(find "$dir" -maxdepth 1 -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)
-  if [ -n "$newest" ]; then
-    touch -m -r "$newest" "$dir"
-  fi
+  [ -n "$newest" ] && touch -m -r "$newest" "$dir"
 done
 
 touch -m -r "$(find mediasrv -type f -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)" mediasrv/etc
 touch -m -r "$(find mediasrv -type f -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)" mediasrv
 
-tar --sort=name --owner=0 --group=0 --numeric-owner -C mediasrv -czf mediasrv-${arch}.tgz .
-touch -m -r mediasrv mediasrv-${arch}.tgz
+output="mediasrv-${arch}.tgz"
+tar --sort=name --owner=0 --group=0 --numeric-owner -C mediasrv -czf "$output" .
+touch -m -r mediasrv "$output"
+
+ls -lh "$output"
+sha256sum "$output"
 
 rm -rf mediasrv go* fakebroker.go

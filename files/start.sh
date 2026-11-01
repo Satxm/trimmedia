@@ -15,7 +15,7 @@ trap shutdown SIGINT SIGTERM
 pid1=$!
 
 # start rpcbroker
-/usr/trim/bin/rpcbroker -u ${USER_NAME} -f ${MEDIA_DIRS} &
+/usr/trim/bin/rpcbroker -u "${USER_NAME}" -f "${MEDIA_DIRS}" &
 pid2=$!
 
 # init database
@@ -25,8 +25,8 @@ if [ ! -f /vol1/@appdata/trim.media/database/trimmedia.db ]; then
   sed "s/___USER_NAME___/${USER_NAME}/g" /var/apps/trim.media/media.sql | sqlite3 /vol1/@appdata/trim.media/database/trimmedia.db
 fi
 
-# change owner
-chown -R ${PUID}:${GUID} ${MEDIA_DIRS}
+# fix ownership
+chown -R "${PUID}:${GUID}" "${MEDIA_DIRS}"
 
 # start trim-media
 /var/apps/trim.media/target/trim-media --port=8005 \
